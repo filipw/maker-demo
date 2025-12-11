@@ -1,20 +1,25 @@
 import os
 import re
 from collections import Counter
-from mlx_lm.utils import load
-from mlx_lm.generate import generate
-from mlx_lm.sample_utils import make_sampler
-from huggingface_hub.utils.tqdm import disable_progress_bars
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # suppress noisy hugging face stuff
-disable_progress_bars()
+# disable_progress_bars()
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-LOCAL_MODEL_PATH = "mlx-community/Phi-4-mini-instruct-4bit"
+LOCAL_MODEL_PATH = "microsoft/Phi-4-mini-instruct"
 
 class LocalAgent:
     def __init__(self, model_path):
-        self.model, self.tokenizer = load(model_path) # type: ignore
+        self.device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {self.device}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path, 
+            torch_dtype=torch.float16, 
+            trust_remote_code=True
+        ).to(self.device)
 
     def run_inference(self, prompt: str, temp: float) -> str:
         messages = [
@@ -29,24 +34,21 @@ class LocalAgent:
             {"role": "user", "content": prompt}
         ]
 
-        if hasattr(self.tokenizer, "apply_chat_template") and self.tokenizer.chat_template:
-            full_prompt = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            ) # type: ignore
-        else:
-            full_prompt = prompt
+        full_prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
 
-        response = generate(
-            self.model, 
-            self.tokenizer, 
-            prompt=full_prompt, 
-            max_tokens=600, 
-            verbose=False,
-            sampler=make_sampler(temp) 
+        inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.device)
+        
+        outputs = self.model.generate(
+            **inputs, 
+            max_new_tokens=600, 
+            temperature=temp,
+            do_sample=True if temp > 0 else False,
+            pad_token_id=self.tokenizer.eos_token_id
         )
         
-        for token in ["<|assistant|>", "<|end|>", "<|user|>"]:
-            response = response.replace(token, "")
+        response = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
             
         return response.strip()
 
